@@ -19,23 +19,18 @@ class MovieRecommender:
 
     def _load_data(self):
         """Loads and processes movie and credits data."""
-        # Load CSV files
         movies = pd.read_csv(self.movies_path)
         credits = pd.read_csv(self.credits_path)
 
-        # Merge datasets on title
         df = movies.merge(credits, on='title')
 
-        # Select only required columns
         df = df[['movie_id', 'title', 'overview', 'genres', 'keywords', 'cast', 'crew']].dropna()
 
-        # Process each column
         df['genres'] = df['genres'].apply(extract_names)
         df['keywords'] = df['keywords'].apply(extract_names)
         df['cast'] = df['cast'].apply(extract_names)
         df['crew'] = df['crew'].apply(extract_director)
 
-        # Create 'tags' column by combining all textual info
         df['tags'] = (
             df['overview'] + ' ' +
             df['genres'].apply(lambda x: ' '.join(x)) + ' ' +
