@@ -1,0 +1,13 @@
+venv/
+movie_recommender/models/
+movie_recommender/cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+*.env
+*.DS_Store
+*.egg-info
