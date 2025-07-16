@@ -1,3 +1,13 @@
 pandas
 scikit-learn
 numpy
+fastapi
+uvicorn[standard]
+pydantic
+sqlalchemy
+psycopg2-binary # PostgreSQL driver
+numpy
+pandas
+sentence-transformers
+faiss-cpu # or faiss-gpu
+python-dotenv # For loading .env file
