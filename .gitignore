@@ -11,3 +11,6 @@ __pycache__/
 *.env
 *.DS_Store
 *.egg-info
+
+movie_recommender/cache/*
+!movie_recommender/cache/README.md
