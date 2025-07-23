@@ -1,4 +1,4 @@
-# main.py (Full Updated Version with External API Integration, Feedback, Reset, Decay)
+# main.py (Fully Corrected Version)
 import os
 import sys
 import difflib
@@ -6,7 +6,7 @@ import requests
 import numpy as np
 from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Body, Depends
+from fastapi import FastAPI, HTTPException, Body, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import Connection, select, insert
@@ -31,6 +31,9 @@ app = FastAPI(
     title="Smart Movie Recommender API (PostgreSQL Backend)",
     description="API for personalized movie recommendations with persistent user data in PostgreSQL.",
     version="1.0.0",
+    docs_url="/recommend/docs",        # ← Swagger UI here
+    redoc_url="/recommend/redoc",      # ← Optional
+    openapi_url="/recommend/openapi.json",  # ← Needed by Swagger
 )
 
 origins = ["http://localhost:4200", "http://127.0.0.1:4200"]
@@ -42,6 +45,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+router = APIRouter()
 
 recommender: SmartMovieRecommender = None
 
@@ -121,14 +126,13 @@ async def get_current_user_id_dependency(
     return user_id
 
 # --- Endpoints ---
-@app.post("/feedback")
+@router.post("/feedback")
 async def give_feedback(
     payload: FeedbackRequest,
     conn: Connection = Depends(get_db_connection)
 ):
     global recommender
 
-    # 1. Ensure user exists
     stmt = select(users_table.c.id).where(users_table.c.username == payload.username)
     user_id = conn.execute(stmt).scalar_one_or_none()
     if user_id is None:
@@ -139,13 +143,11 @@ async def give_feedback(
 
     recommender.load_user_state(conn, user_id)
 
-    # 2. Ensure movie exists in local dataset
     idx, matched_title = find_movie_index_by_title(recommender, payload.title)
     if idx is None:
         external_movies = fetch_external_movies()
         match = match_external_movie(payload.title, external_movies)
         if match:
-            # Add to recommender.movies
             recommender.movies.loc[len(recommender.movies)] = {
                 "movie_id": match["id"],
                 "title": match["title"],
@@ -156,7 +158,6 @@ async def give_feedback(
                 "crew": "",
                 "tags": match["title"].lower()
             }
-            # Regenerate embeddings and reset index
             recommender.movies.reset_index(drop=True, inplace=True)
             recommender.embeddings = recommender._compute_embeddings(recommender.movies["tags"])
             recommender.index = recommender._build_faiss_index(recommender.embeddings)
@@ -164,7 +165,6 @@ async def give_feedback(
         else:
             raise HTTPException(status_code=404, detail="Movie not found in dataset or external API.")
 
-    # 3. Give feedback
     recommender.give_feedback(conn, matched_title, payload.score)
 
     return {
@@ -173,7 +173,7 @@ async def give_feedback(
     }
 
 
-@app.post("/profile/reset")
+@router.post("/profile/reset")
 async def reset_user_profile(
     payload: UserRecommendationQuery,
     conn: Connection = Depends(get_db_connection)
@@ -188,7 +188,7 @@ async def reset_user_profile(
     recommender.reset_profile(conn)
     return {"status": "success", "message": f"Profile reset for {payload.username}"}
 
-@app.post("/profile/decay")
+@router.post("/profile/decay")
 async def decay_user_preferences(
     payload: UserRecommendationQuery,
     conn: Connection = Depends(get_db_connection)
@@ -203,7 +203,7 @@ async def decay_user_preferences(
     recommender.decay_preferences(conn, decay_rate=0.01)
     return {"status": "success", "message": f"Genre preferences decayed for {payload.username}"}
 
-@app.post("/recommend/from_profile", response_model=RecommendationResponse)
+@router.post("/from_profile", response_model=RecommendationResponse)
 async def get_recommendations_from_profile(
     current_user_id: Annotated[int, Depends(get_current_user_id_dependency)],
     request: UserRecommendationQuery = Depends(get_user_query),
@@ -222,9 +222,43 @@ async def get_recommendations_from_profile(
             if match:
                 matched_results.append(match)
             else:
-                matched_results.append({"id": None, "title": title})  # fallback if not matched
+                matched_results.append({"id": None, "title": title})
 
         return RecommendationResponse(recommendations=matched_results)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recommend/rl", response_model=RecommendationResponse)
+async def get_recommendation_from_rl(
+    current_user_id: Annotated[int, Depends(get_current_user_id_dependency)],
+    request: UserRecommendationQuery = Depends(get_user_query),
+    conn: Connection = Depends(get_db_connection)
+):
+    global recommender
+
+    if not recommender or recommender.current_user_id != current_user_id:
+        raise HTTPException(status_code=503, detail="Recommender context error.")
+
+    try:
+        state_key = recommender._get_user_state_key()
+        action_idx = recommender.rl_agent.choose_action(state_key)
+        movie = recommender.movies.iloc[action_idx]
+        
+        # Log action into memory/profile like a normal rec
+        vector = recommender.embeddings[action_idx].reshape(1, -1)
+        recommender._update_user_memory(vector)
+        recommender._update_user_profile(vector)
+        recommender.save_user_state(conn)
+
+        return RecommendationResponse(recommendations=[{
+            "id": movie.movie_id,
+            "title": movie.title
+        }])
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"RL recommendation failed: {str(e)}")
+    
+
+app.include_router(router, prefix="/recommend")

@@ -8,13 +8,12 @@ from sentence_transformers import SentenceTransformer
 from sklearn.preprocessing import normalize
 from collections import defaultdict
 from .utils import extract_names, extract_director
+from reinforcement.agent import QLearningAgent
 
-# Import SQLAlchemy Core components
 from sqlalchemy import Connection, select, insert, update, delete
-from datetime import datetime, timezone # Use timezone.utc for consistency
+from datetime import datetime, timezone 
 
-# Import database tables from your database.py (Adjust path if necessary)
-# Assuming database.py is in the parent directory of movie_recommender
+
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from database import users_table, user_profiles_table, user_memory_entries_table, user_genre_preferences_table
@@ -24,8 +23,8 @@ class SmartMovieRecommender:
     def __init__(self, movies_csv, credits_csv, model_path):
         print("[INIT] Loading SentenceTransformer model from:", model_path)
         self.model = SentenceTransformer(model_path)
-        
-        self.current_user_id: int | None = None # This will store the ID of the user whose state is currently loaded
+        self.rl_agent = QLearningAgent(actions=list(range(len(self.movies))))
+        self.current_user_id: int | None = None 
         self._user_profile: np.ndarray | None = None # In-memory NumPy array for user's profile
         self._user_memory: list[np.ndarray] = [] # In-memory list of NumPy arrays for user's memory
         self._genre_preferences: defaultdict = defaultdict(float) # In-memory dict for genre preferences
@@ -40,7 +39,10 @@ class SmartMovieRecommender:
         # Build FAISS index from movie embeddings
         self.index = self._build_faiss_index(self.embeddings)
         print("[INIT] System ready ✅")
-        
+
+    def _get_user_state_key(self):
+        return str(sorted(self._genre_preferences.items()))
+    
     def _preprocess(self, movies_csv, credits_csv):
         cache_file = "movie_recommender/cache/movies.pkl"
         if os.path.exists(cache_file):

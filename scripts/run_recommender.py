@@ -46,4 +46,4 @@ except ValueError as e:
 
 # Save user state
 recommender.save_user_state()
-print("\n✅ User session saved.")
+print("\nUser session saved.")
