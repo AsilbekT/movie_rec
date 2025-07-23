@@ -30,7 +30,7 @@ class SmartMovieRecommender:
 
         self.movies = self._preprocess(movies_csv, credits_csv)
         print(f"[INIT] Loaded {len(self.movies)} movies")
-        self.rl_agent = QLearningAgent(actions=list(range(len(self.movies))))
+        self.rl_agent = QLearningAgent(action_space=list(range(len(self.movies))))
 
         # This will load embeddings from cache or compute them and save them.
         self.embeddings = self._compute_embeddings(self.movies['tags'])
