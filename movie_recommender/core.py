@@ -23,7 +23,6 @@ class SmartMovieRecommender:
     def __init__(self, movies_csv, credits_csv, model_path):
         print("[INIT] Loading SentenceTransformer model from:", model_path)
         self.model = SentenceTransformer(model_path)
-        self.rl_agent = QLearningAgent(actions=list(range(len(self.movies))))
         self.current_user_id: int | None = None 
         self._user_profile: np.ndarray | None = None # In-memory NumPy array for user's profile
         self._user_memory: list[np.ndarray] = [] # In-memory list of NumPy arrays for user's memory
@@ -31,6 +30,8 @@ class SmartMovieRecommender:
 
         self.movies = self._preprocess(movies_csv, credits_csv)
         print(f"[INIT] Loaded {len(self.movies)} movies")
+        self.rl_agent = QLearningAgent(actions=list(range(len(self.movies))))
+
         # This will load embeddings from cache or compute them and save them.
         self.embeddings = self._compute_embeddings(self.movies['tags'])
         print(f"[INIT] Embedding shape: {self.embeddings.shape}")
