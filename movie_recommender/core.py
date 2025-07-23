@@ -31,7 +31,6 @@ class SmartMovieRecommender:
 
         self.movies = self._preprocess(movies_csv, credits_csv)
         print(f"[INIT] Loaded {len(self.movies)} movies")
-        
         # This will load embeddings from cache or compute them and save them.
         self.embeddings = self._compute_embeddings(self.movies['tags'])
         print(f"[INIT] Embedding shape: {self.embeddings.shape}")
