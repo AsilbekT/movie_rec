@@ -19,27 +19,56 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from database import users_table, user_profiles_table, user_memory_entries_table, user_genre_preferences_table
 
 
+
 class SmartMovieRecommender:
     def __init__(self, movies_csv, credits_csv, model_path):
         print("[INIT] Loading SentenceTransformer model from:", model_path)
         self.model = SentenceTransformer(model_path)
         self.current_user_id: int | None = None 
-        self._user_profile: np.ndarray | None = None # In-memory NumPy array for user's profile
-        self._user_memory: list[np.ndarray] = [] # In-memory list of NumPy arrays for user's memory
-        self._genre_preferences: defaultdict = defaultdict(float) # In-memory dict for genre preferences
+        self._user_profile: np.ndarray | None = None
+        self._user_memory: list[np.ndarray] = []
+        self._genre_preferences: defaultdict = defaultdict(float)
 
         self.movies = self._preprocess(movies_csv, credits_csv)
         print(f"[INIT] Loaded {len(self.movies)} movies")
         self.rl_agent = QLearningAgent(action_space=list(range(len(self.movies))))
 
-        # This will load embeddings from cache or compute them and save them.
         self.embeddings = self._compute_embeddings(self.movies['tags'])
         print(f"[INIT] Embedding shape: {self.embeddings.shape}")
         
-        # Build FAISS index from movie embeddings
         self.index = self._build_faiss_index(self.embeddings)
         print("[INIT] System ready ✅")
 
+    def _user_cache_dir(self, user_id: int):
+        path = f"movie_recommender/cache/users/{user_id}"
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _save_local_user_cache(self):
+        if self.current_user_id is None:
+            return
+        path = self._user_cache_dir(self.current_user_id)
+        if self._user_profile is not None:
+            np.save(os.path.join(path, "profile.npy"), self._user_profile)
+        if self._user_memory:
+            memory_stack = np.stack(self._user_memory)
+            np.save(os.path.join(path, "memory.npy"), memory_stack)
+
+    def _load_local_user_cache(self):
+        if self.current_user_id is None:
+            return
+        path = self._user_cache_dir(self.current_user_id)
+        try:
+            profile_path = os.path.join(path, "profile.npy")
+            memory_path = os.path.join(path, "memory.npy")
+            if os.path.exists(profile_path):
+                self._user_profile = np.load(profile_path)
+            if os.path.exists(memory_path):
+                memory_stack = np.load(memory_path)
+                self._user_memory = [vec.reshape(1, -1) for vec in memory_stack]
+        except Exception as e:
+            print(f"[CACHE] Failed to load user cache: {e}")
+    
     def _get_user_state_key(self):
         return str(sorted(self._genre_preferences.items()))
     
@@ -104,41 +133,73 @@ class SmartMovieRecommender:
     def load_user_state(self, conn: Connection, user_id: int):
         """
         Loads the user's profile, memory, and genre preferences from the database
-        into the recommender's in-memory state.
+        into the recommender's in-memory state. Falls back to local cache if DB is empty.
         """
         self.current_user_id = user_id
-        
+        cache_dir = self._user_cache_dir(user_id)
+
         # Load User Profile
         stmt = select(user_profiles_table.c.profile_vector).where(user_profiles_table.c.user_id == user_id)
         result = conn.execute(stmt).scalar_one_or_none()
         if result is not None:
-            # Convert list[float] from DB back to numpy array
             self._user_profile = np.array(result).reshape(1, -1)
             print(f"[USER {user_id}] Loaded profile from DB.")
+        elif os.path.exists(f"{cache_dir}/profile.npy"):
+            self._user_profile = np.load(f"{cache_dir}/profile.npy").reshape(1, -1)
+            print(f"[USER {user_id}] Loaded profile from local cache.")
         else:
             self._user_profile = None
-            print(f"[USER {user_id}] No profile found in DB, starting fresh.")
+            print(f"[USER {user_id}] No profile found in DB or cache, starting fresh.")
 
-        # Load User Memory (top 10 by timestamp)
+        # Load User Memory
         stmt = select(user_memory_entries_table.c.movie_embedding)\
-               .where(user_memory_entries_table.c.user_id == user_id)\
-               .order_by(user_memory_entries_table.c.timestamp.desc())\
-               .limit(10)
+            .where(user_memory_entries_table.c.user_id == user_id)\
+            .order_by(user_memory_entries_table.c.timestamp.desc())\
+            .limit(10)
         memory_results = conn.execute(stmt).fetchall()
-        # Convert list[float] from DB back to list of numpy arrays
-        self._user_memory = [np.array(entry[0]).reshape(1, -1) for entry in memory_results]
-        print(f"[USER {user_id}] Loaded {len(self._user_memory)} memory entries from DB.")
+        if memory_results:
+            self._user_memory = [np.array(entry[0]).reshape(1, -1) for entry in memory_results]
+            print(f"[USER {user_id}] Loaded {len(self._user_memory)} memory entries from DB.")
+        elif os.path.exists(f"{cache_dir}/memory.npy"):
+            self._user_memory = list(np.load(f"{cache_dir}/memory.npy", allow_pickle=True))
+            print(f"[USER {user_id}] Loaded memory from local cache ({len(self._user_memory)} entries).")
+        else:
+            self._user_memory = []
+            print(f"[USER {user_id}] No memory found in DB or cache.")
 
         # Load User Genre Preferences
         stmt = select(user_genre_preferences_table.c.preferences_data).where(user_genre_preferences_table.c.user_id == user_id)
         genre_prefs_data = conn.execute(stmt).scalar_one_or_none()
         if genre_prefs_data is not None:
-            # Convert dict from DB back to defaultdict
             self._genre_preferences = defaultdict(float, genre_prefs_data)
             print(f"[USER {user_id}] Loaded genre preferences from DB.")
         else:
             self._genre_preferences = defaultdict(float)
             print(f"[USER {user_id}] No genre preferences found in DB, starting fresh.")
+
+
+    def add_external_movie(self, movie_dict: dict):
+        """
+        Adds an external movie (from API) into the system temporarily for feedback tracking.
+        """
+        # You can optionally enrich this if you store external movies
+        title = movie_dict["title"]
+        vector = self.model.encode([title])
+        self.embeddings = np.vstack([self.embeddings, normalize(vector)])
+        
+        # Append to movies DataFrame
+        new_row = {
+            "movie_id": movie_dict["id"],
+            "title": movie_dict["title"],
+            "genres": [],
+            "keywords": [],
+            "cast": [],
+            "crew": "",
+            "tags": movie_dict["title"].lower()
+        }
+        self.movies.loc[len(self.movies)] = new_row
+        self.index.add(normalize(vector).astype(np.float32))  # Update FAISS
+        self.rl_agent.actions.append(len(self.movies) - 1)  # Add to RL action space
 
     def save_user_state(self, conn: Connection):
         """
@@ -227,7 +288,7 @@ class SmartMovieRecommender:
         # Crucial: Commit the transaction after all DML operations for this request
         conn.commit() 
         print(f"[USER {self.current_user_id}] All state changes committed to DB.")
-
+        self._save_local_user_cache()
 
     def _update_user_memory(self, vector: np.ndarray):
         """Internal method to update the in-memory user memory."""
@@ -301,19 +362,22 @@ class SmartMovieRecommender:
         if self._user_profile is None:
             raise ValueError(f"No user profile available for user {self.current_user_id}.")
         
-        # Search for similar movies using the user's profile vector
-        # Search more results (e.g., 50) to allow for genre filtering if explaining
-        _, indices = self.index.search(self._user_profile.astype(np.float32), 50) 
+        # Search for more than top_k to account for filtering and deduplication
+        _, indices = self.index.search(self._user_profile.astype(np.float32), 50)
 
         results = []
+        seen_titles = set()
         for i in indices[0]:
             movie = self.movies.iloc[i]
-            genres = movie.genres # Get genres from the preprocessed DataFrame
-            
-            # Calculate genre score based on current genre preferences
-            genre_score = sum([self._genre_preferences.get(g, 0) for g in genres])
             title = movie.title
-            
+
+            if title in seen_titles:
+                continue
+            seen_titles.add(title)
+
+            genres = movie.genres
+            genre_score = sum([self._genre_preferences.get(g, 0) for g in genres])
+
             if explain:
                 results.append({
                     "title": title,
@@ -321,17 +385,26 @@ class SmartMovieRecommender:
                     "genre_score": round(genre_score, 2)
                 })
             else:
-                results.append(title)
-        
+                results.append({
+                    "id": movie.movie_id,
+                    "title": title,
+                    "reason": [
+                        f"Genres matched: {', '.join(genres)}" if genres else "Similar to your profile vector"
+                    ]
+                })
+
+            if len(results) >= top_k:
+                break
+
         if explain:
-            # Sort results by genre_score (higher is better) and then take top_k
             sorted_results = sorted(results, key=lambda x: x["genre_score"], reverse=True)[:top_k]
-            # Print explanation to console for debugging/logging
             for r in sorted_results:
                 print(f"[EXPLAIN] {r['title']}: genre_score={r['genre_score']} from genres={r['genres']}")
             return [r['title'] for r in sorted_results]
         else:
-            return results[:top_k]
+            return results
+
+
 
     def reset_profile(self, conn: Connection):
         """
@@ -345,31 +418,49 @@ class SmartMovieRecommender:
 
     def give_feedback(self, conn: Connection, title: str, score: float):
         """
-        Processes user feedback for a movie, updating the user's profile and
-        genre preferences, and then saving the state to the database.
+        Processes user feedback for a movie, updating the user's profile,
+        genre preferences, and reinforcement agent, then saving to DB.
         """
         if title not in self.movies['title'].values:
             print(f"[FEEDBACK] '{title}' not found.")
-            return # Or raise ValueError, depending on desired behavior for unknown movies
+            return
 
         idx = self.movies[self.movies['title'] == title].index[0]
         vector = self.embeddings[idx].reshape(1, -1)
         genres = self.movies.iloc[idx]['genres']
         
-        alpha = min(max(abs(score), 0.1), 1.0) # Ensure alpha is between 0.1 and 1.0
-        sign = np.sign(score) # Get sign of the score (+1 for like, -1 for dislike)
-        
-        if sign > 0: # User liked the movie
+        alpha = min(max(abs(score), 0.1), 1.0)
+        sign = np.sign(score)
+
+        if sign > 0:
             print(f"[FEEDBACK] 👍 Liked '{title}' with score {score}")
             self._update_user_profile(vector, alpha=alpha)
             for genre in genres:
-                self._genre_preferences[genre] += score # Increase preference for these genres
-        else: # User disliked the movie
+                self._genre_preferences[genre] += score
+        else:
             print(f"[FEEDBACK] 👎 Disliked '{title}' with score {score}")
             for genre in genres:
-                self._genre_preferences[genre] -= abs(score) # Decrease preference for these genres
-        
-        self.save_user_state(conn) # Save the updated state to DB
+                self._genre_preferences[genre] -= abs(score)
+
+        # ➕ Reinforcement Learning integration
+        try:
+            state_key = self._get_user_state_key()
+            action = idx
+            reward = float(score)
+            
+            # Temporary profile update for next state
+            self._update_user_profile(vector, alpha=alpha)
+            next_state_key = self._get_user_state_key()
+
+            # Restore profile back (optional depending on your logic)
+            # Or you can clone state before modifying
+            self.rl_agent.update(state_key, action, reward, next_state_key)
+            self.rl_agent.decay_epsilon()
+            print(f"[RL] Updated Q-table for action={action} with reward={reward}")
+        except Exception as e:
+            print(f"[RL] ❌ Failed to update Q-learning agent: {e}")
+
+        self.save_user_state(conn)
 
     def decay_preferences(self, conn: Connection, decay_rate=0.01):
         """
@@ -383,3 +474,49 @@ class SmartMovieRecommender:
             if abs(self._genre_preferences[g]) < 0.01:
                 del self._genre_preferences[g]
         self.save_user_state(conn) # Save the decayed state to DB
+
+
+    def recommend_from_rl(self, top_k=5):
+        """
+        Recommend movies based on the Q-learning policy.
+        It uses current genre preferences as the state.
+        """
+        state_key = self._get_user_state_key()
+
+        # Rank actions (movie indices) by Q-value for current state
+        q_values = [(a, self.rl_agent.q_table[(state_key, a)]) for a in self.rl_agent.actions]
+        ranked = sorted(q_values, key=lambda x: x[1], reverse=True)
+
+        recommendations = []
+        seen_titles = set()
+        for action_idx, q in ranked:
+            movie = self.movies.iloc[action_idx]
+            title = movie.title
+
+            if title in seen_titles:
+                continue  # Avoid duplicates
+            seen_titles.add(title)
+
+            genres = movie.genres
+            genre_score = sum([self._genre_preferences.get(g, 0) for g in genres])
+
+            # Optional genre filter (disable this if too strict)
+            if genre_score <= -2:
+                continue
+
+            recommendations.append({
+                "id": movie.movie_id,
+                "title": title,
+                "reason": [
+                    f"Recommended based on Q-learning (score={round(q, 2)})",
+                    f"Genres: {genres}"
+                ]
+            })
+
+            if len(recommendations) >= top_k:
+                break
+
+        print(f"[RL] Final recommendations: {[r['title'] for r in recommendations]}")
+        return recommendations
+
+
